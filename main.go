@@ -91,7 +91,6 @@ func main() {
 
 	elapsed := time.Since(start)
 	log.Printf("Startup complete, took %s\n", elapsed)
-	fmt.Println(token)
 
 	//Start listening for webhook
 	http.HandleFunc("/webhook", handleHook)
@@ -153,7 +152,7 @@ func checkRateLimit(response *http.Response) {
 	remainingPoints, err := strconv.Atoi(response.Header.Get("Ratelimit-Remaining"))
 	checkError(err)
 	log.Println("Remaining points:", remainingPoints)
-	if remainingPoints < 1 {
+	if response.StatusCode == 429 {
 		//Find reset time
 		i, err := strconv.ParseInt(response.Header.Get("Ratelimit-Reset"), 10, 64)
 		checkError(err)
