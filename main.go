@@ -14,15 +14,18 @@ import (
 )
 
 const ClientID = `ari2vux13uqzdxek5b4r1vw2vg80ix`
+const TopicURL = `https://api.twitch.tv/helix/streams?user_id=`
 
-type ConfigData struct {
+type MainData struct {
 	Streamer string
 	CallbackURL string
 	Port string
 	ID string
+	Token string
+	Online bool
 }
 
-var configdata ConfigData
+var maindata MainData
 
 func checkError(err error) {
 	if err != nil {
@@ -39,19 +42,21 @@ func main() {
 	client := http.Client{}
 	//Get an access token
 	token := getToken()
+	maindata.Token = token
 
 	//TODO: Get config values
-	configdata.Streamer = "cactuspupbot"
-	configdata.CallbackURL = "https://480ba225.ngrok.io"
-	configdata.Port = "8080"
+	maindata.Streamer = "cactuspupbot"
+	maindata.CallbackURL = "https://480ba225.ngrok.io"
+	maindata.Port = "8080"
+	maindata.Online = false
 
-	streamer := configdata.Streamer
-	callbackURL := configdata.CallbackURL
-	port := configdata.Port
+	streamer := maindata.Streamer
+	callbackURL := maindata.CallbackURL
+	port := maindata.Port
 
 	//Get streamer ID
 	id := getStreamerID(streamer, token, client)
-	configdata.ID = id
+	maindata.ID = id
 	log.Println("Now tracking",streamer,"(ID:",id+")")
 
 	//Subscribe to proper webhook
@@ -59,8 +64,8 @@ func main() {
 	payload := map[string]interface{}{
 		"hub.callback":      callbackURL+"/webhook",
 		"hub.mode":          "subscribe",
-		"hub.topic":         "https://api.twitch.tv/helix/streams?user_id=" + id,
-		"hub.lease_seconds": "0",
+		"hub.topic":         TopicURL + id,
+		"hub.lease_seconds": "1000",
 		"hub.secret":        secret.PayloadSecret,
 	}
 	payloadBytes, err := json.Marshal(payload)
@@ -86,6 +91,7 @@ func main() {
 
 	elapsed := time.Since(start)
 	log.Printf("Startup complete, took %s\n", elapsed)
+	fmt.Println(token)
 
 	//Start listening for webhook
 	http.HandleFunc("/webhook", handleHook)
@@ -113,7 +119,6 @@ func getStreamerID(streamer string, token string, client http.Client) (id string
 	err = json.Unmarshal(body, &responseJson)
 	_ = response.Body.Close()
 	checkError(err)
-	fmt.Printf("%v\n", responseJson)
 
 	//Check user actually exists
 	responseData := responseJson["data"]
@@ -165,17 +170,25 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" || r.Method == "" {
 		query := r.URL.Query()
 		if query["hub.mode"][0] == "denied" {
-			log.Fatalln("Subscription to webhook was denied")
+			_, err := fmt.Fprintf(w, "200 OK", nil)
+			checkError(err)
+			log.Println("Subscription to webhook was denied")
+			return
 		}
 		if !checkRequest(query) {
-			log.Fatalln("Did not get same subscription back")
+			log.Println("Did not get same subscription back")
+			return
 		}
-
+		challenge := query["hub.challenge"][0]
+		log.Println("Challenge:",challenge)
+		_, err := w.Write([]byte(challenge))
+		checkError(err)
+		return
 	}
 	//TODO: handle payload
 }
 
 //Checks that the request is what we requested
 func checkRequest(values url.Values) bool {
-
+	return values["hub.topic"][0] == TopicURL + maindata.ID
 }
