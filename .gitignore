@@ -2,3 +2,4 @@
 /.idea/
 /main.exe
 /secret/clientsecret.go
+/config.yml

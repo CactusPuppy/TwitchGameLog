@@ -113,7 +113,7 @@ func getConfigData() (cont bool) {
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		log.Println(`No config.yml file found, generating with defaults...
 				PLEASE SET CONFIG VALUES BEFORE RESTARTING`)
-		configBytes, err := json.Marshal(DefaultConfig)
+		configBytes, err := json.MarshalIndent(DefaultConfig, "", "    ")
 		checkError(err)
 		err = ioutil.WriteFile(configPath, configBytes, 0777)
 		checkError(err)
