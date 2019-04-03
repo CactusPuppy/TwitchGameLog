@@ -30,6 +30,7 @@ type MainData struct {
 	ID string
 	Token string
 	Online bool
+	Game string
 }
 
 var maindata MainData
@@ -51,10 +52,6 @@ func main() {
 	token := getToken()
 	maindata.Token = token
 
-	//TODO: Get config values
-	maindata.Streamer = "cactuspupbot"
-	maindata.CallbackURL = "https://480ba225.ngrok.io"
-	maindata.Port = "8080"
 	maindata.Online = false
 
 	if !getConfigData() {
@@ -201,7 +198,7 @@ func checkRateLimit(response *http.Response) {
 	}
 }
 
-//Handles when the webhook issues a thingy
+//Handles when the webhook issues a payload
 func handleHook(w http.ResponseWriter, r *http.Request) {
 	//Respond to challenge query
 	if r.Method == "GET" || r.Method == "" {
@@ -217,12 +214,12 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		challenge := query["hub.challenge"][0]
-		log.Println("Challenge:",challenge)
 		_, err := w.Write([]byte(challenge))
 		checkError(err)
 		return
 	}
 	//TODO: handle payload
+	fmt.Printf("%v\n", r.Body)
 }
 
 //Checks that the request is what we requested
