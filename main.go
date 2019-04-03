@@ -9,12 +9,19 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 )
 
 const ClientID = `ari2vux13uqzdxek5b4r1vw2vg80ix`
 const TopicURL = `https://api.twitch.tv/helix/streams?user_id=`
+
+var DefaultConfig = map[string]interface{} {
+	"streamer": "STREAMER NAME HERE",
+	"callbackURL": "CALLBACK URL HERE",
+	"port": "8080",
+}
 
 type MainData struct {
 	Streamer string
@@ -50,6 +57,10 @@ func main() {
 	maindata.Port = "8080"
 	maindata.Online = false
 
+	if !getConfigData() {
+		return
+	}
+
 	streamer := maindata.Streamer
 	callbackURL := maindata.CallbackURL
 	port := maindata.Port
@@ -70,10 +81,6 @@ func main() {
 	}
 	payloadBytes, err := json.Marshal(payload)
 	checkError(err)
-
-	//TEMP
-	var unmarsh map[string]interface{}
-	err = json.Unmarshal(payloadBytes, &unmarsh)
 
 	//Create request
 	request, err := http.NewRequest("POST", hookURL, bytes.NewBuffer(payloadBytes))
@@ -96,6 +103,33 @@ func main() {
 	http.HandleFunc("/webhook", handleHook)
 	err = http.ListenAndServe(":"+port, nil)
 	checkError(err)
+}
+
+// Put config data into main data if it can be found
+// Returns whether the data was got and the program can continue
+func getConfigData() (cont bool) {
+	configPath := "config.yml"
+	//Check if config exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Println(`No config.yml file found, generating with defaults...
+				PLEASE SET CONFIG VALUES BEFORE RESTARTING`)
+		configBytes, err := json.Marshal(DefaultConfig)
+		checkError(err)
+		err = ioutil.WriteFile(configPath, configBytes, 0777)
+		checkError(err)
+		return false
+	}
+	//Extract json from config
+	data, err := ioutil.ReadFile(configPath)
+	checkError(err)
+	var dataJson map[string]interface{}
+	err = json.Unmarshal(data, &dataJson)
+	checkError(err)
+	//Set maindata stuff
+	maindata.Streamer = dataJson["streamer"].(string)
+	maindata.CallbackURL = dataJson["callbackURL"].(string)
+	maindata.Port = dataJson["port"].(string)
+	return true
 }
 
 func getStreamerID(streamer string, token string, client http.Client) (id string) {
@@ -136,6 +170,10 @@ func getToken() string {
 		"&client_secret="+secret.ClientSecret+
 		"&grant_type=client_credentials", "application/json", nil)
 	checkError(err)
+	if response.StatusCode != 200 {
+		log.Fatal("Failed to get token, status code:",response.StatusCode)
+		return ""
+	}
 	var resultJson map[string]interface{}
 	err = json.NewDecoder(response.Body).Decode(&resultJson)
 	checkError(err)
@@ -165,7 +203,7 @@ func checkRateLimit(response *http.Response) {
 
 //Handles when the webhook issues a thingy
 func handleHook(w http.ResponseWriter, r *http.Request) {
-	//TODO: Respond to query
+	//Respond to challenge query
 	if r.Method == "GET" || r.Method == "" {
 		query := r.URL.Query()
 		if query["hub.mode"][0] == "denied" {
