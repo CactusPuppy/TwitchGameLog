@@ -103,7 +103,8 @@ func main() {
 	//Subscribe to proper webhook
 	subToWebhook(callbackURL, id)
 
-	//TODO: Perform initial query
+	//Perform initial query
+	setupStreamerData()
 
 	//Setup complete mark
 	elapsed := time.Since(start)
@@ -113,8 +114,41 @@ func main() {
 	http.HandleFunc("/webhook", handleHook)
 	err = http.ListenAndServe(":"+port, nil)
 	checkErrorFatal(err)
+}
 
-	fmt.Println("test")
+func setupStreamerData() {
+	//Form request for stream data
+	request, err := http.NewRequest("GET", TopicURL+Maindata.ID, nil)
+	checkError(err)
+	//Add auth header
+	request.Header.Set("Client-ID", ClientID)
+	request.Header.Set("Authorization", "Bearer "+Maindata.Token)
+	//Get response
+	response, err := client.Do(request)
+	checkError(err)
+	checkRateLimit(response)
+	body, err := ioutil.ReadAll(response.Body)
+	checkError(err)
+	//Extract response to JSON
+	var responseJson map[string]interface{}
+	err = json.Unmarshal(body, &responseJson)
+	checkError(err)
+	//Check if online
+	responseData := responseJson["data"].([]interface{})
+	if len(responseData) == 0 {
+		Streamerdata.Online = false
+		return
+	}
+	Streamerdata.Online = true
+	//Get stream data
+	streamData := responseData[0].(map[string]interface{})
+	title := streamData["title"].(string)
+	gameid := streamData["game_id"].(string)
+	game, err := getGameFromId(gameid, client)
+	checkError(err)
+	msg := fmt.Sprintf("%s is now playing %s | Title: \"%s\"", Maindata.Streamer, game, title)
+	logEvent(msg, time.Now())
+	updateStreamer(title, game, gameid)
 }
 
 //Refresh hook
@@ -261,7 +295,7 @@ func checkRateLimit(response *http.Response) {
 		checkErrorFatal(err)
 		resetTime := time.Unix(i, 0)
 		resetTimeString := resetTime.Format("3:04 PM")
-		log.Fatalf("Twitch rate limit exceeded, cannot continue (Are you spamming?)\n"+
+		log.Printf("Twitch rate limit exceeded, cannot continue (Are you spamming?)\n"+
 			"Rate limit will reset at: %s", resetTimeString)
 	}
 }
@@ -397,8 +431,7 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 		log.Fatalln("Signature invalid, header:", signature, "| calculated hash:", hash)
 	}
 	//Dealing with a notificaton, get timestamp
-	timestamp, err := time.Parse(time.RFC3339, r.Header.Get("Twitch-Notification-Timestamp"))
-	checkError(err)
+	timestamp := time.Now()
 
 	//Extract JSON payload
 	payload := make(map[string]interface{})
