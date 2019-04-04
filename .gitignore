@@ -3,3 +3,5 @@
 /main.exe
 /secret/clientsecret.go
 /config.json
+/cache.json
+/logs/*

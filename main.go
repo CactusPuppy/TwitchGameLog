@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/cactuspuppy/twitchgamelog/secret"
 	"io/ioutil"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -34,17 +36,31 @@ type MainData struct {
 type StreamerData struct {
 	Online bool
 	Game string
+	GameID string
 	Title string
 }
 
 var Maindata MainData
 var Streamerdata StreamerData
-var Gamecache map[string]string
+var Gamecache = make(map[string]string)
+var cacheDisk = `cache.json`
+var logFilename = ""
+var client = http.Client{}
 
-func checkError(err error) {
+//Fatally reports an error
+func checkErrorFatal(err error) {
 	if err != nil {
 		log.Fatalln(err)
 	}
+}
+
+//Non-fatally reports an error, and returns if there was no error
+func checkError(err error) (ok bool) {
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	return true
 }
 
 //Performs startup tasks
@@ -52,8 +68,6 @@ func main() {
 	start := time.Now()
 	log.Println("Starting TwitchGameLog v0.1 by CactusPuppy")
 
-	//Get our http client
-	client := http.Client{}
 	//Get an access token
 	token := getToken()
 	Maindata.Token = token
@@ -63,50 +77,73 @@ func main() {
 		return
 	}
 
-	//Get game id cache
+	//Load game id cache
+	loadGameCache()
+
+	//Create logs directory if nonexistent
+	logspath := filepath.Join(".", "logs")
+	checkErrorFatal(os.MkdirAll(logspath, os.ModePerm))
 
 	streamer := Maindata.Streamer
 	callbackURL := Maindata.CallbackURL
 	port := Maindata.Port
 
 	//Get streamer ID
-	id := getStreamerID(streamer, token, client)
+	id, err := getStreamerID(streamer, token, client)
+	if err != nil {
+		log.Fatalln("Error getting streamer:", err)
+	}
 	Maindata.ID = id
 	log.Println("Now tracking",streamer,"(ID:",id+")")
 
 	//Subscribe to proper webhook
-	hookURL := `https://api.twitch.tv/helix/webhooks/hub` //TODO
-	payload := map[string]interface{}{
-		"hub.callback":      callbackURL+"/webhook",
-		"hub.mode":          "subscribe",
-		"hub.topic":         TopicURL + id,
-		"hub.lease_seconds": "1000",
-		"hub.secret":        secret.PayloadSecret,
-	}
-	payloadBytes, err := json.Marshal(payload)
-	checkError(err)
+	subToWebhook(callbackURL, id)
 
-	//Create request
-	request, err := http.NewRequest("POST", hookURL, bytes.NewBuffer(payloadBytes))
-	checkError(err)
-	//Add auth header
-	request.Header.Set("Client-ID", ClientID)
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("Content-Type", "application/json")
-	//Perform request
-	response, err := client.Do(request)
-	checkError(err)
-	if response.StatusCode != 202 {
-		log.Fatalln("Payload not accepted, HTTP code", string(response.StatusCode))
-	}
+	//Set log file name
+	t := time.Now()
+	logFilename = "logs/" + t.Format("2006-01-02_15-04-05") + ".log"
 
+	//Setup complete mark
 	elapsed := time.Since(start)
 	log.Printf("Startup complete, took %s\n", elapsed)
 
 	//Start listening for webhook
 	http.HandleFunc("/webhook", handleHook)
 	err = http.ListenAndServe(":"+port, nil)
-	checkError(err)
+	checkErrorFatal(err)
+
+	fmt.Println("test")
+}
+
+//Subscribes to the webhook
+func subToWebhook(callbackURL string, id string) {
+	hookURL := `https://api.twitch.tv/helix/webhooks/hub`
+	payload := map[string]interface{}{
+		"hub.callback":      callbackURL + "/webhook",
+		"hub.mode":          "subscribe",
+		"hub.topic":         TopicURL + id,
+		"hub.lease_seconds": "864000",
+		"hub.secret":        secret.PayloadSecret,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	checkErrorFatal(err)
+	//Create request
+	request, err := http.NewRequest("POST", hookURL, bytes.NewBuffer(payloadBytes))
+	checkErrorFatal(err)
+	//Add auth header
+	request.Header.Set("Client-ID", ClientID)
+	request.Header.Set("Authorization", "Bearer "+Maindata.Token)
+	request.Header.Set("Content-Type", "application/json")
+	//Perform request
+	response, err := client.Do(request)
+	checkErrorFatal(err)
+	if response.StatusCode != 202 {
+		log.Fatalln("Payload not accepted, HTTP code", string(response.StatusCode))
+	}
+}
+
+func unsubFromWebhook(callbackURL string, id string) {
+	//TODO: Unsub from the hook
 }
 
 // Put config data into main data if it can be found
@@ -118,17 +155,17 @@ func getConfigData() (cont bool) {
 		log.Println(`No`, configPath, `file found, generating with defaults...
 				PLEASE SET CONFIG VALUES BEFORE RESTARTING`)
 		configBytes, err := json.MarshalIndent(DefaultConfig, "", "    ")
-		checkError(err)
+		checkErrorFatal(err)
 		err = ioutil.WriteFile(configPath, configBytes, 0777)
-		checkError(err)
+		checkErrorFatal(err)
 		return false
 	}
 	//Extract json from config
 	data, err := ioutil.ReadFile(configPath)
-	checkError(err)
+	checkErrorFatal(err)
 	var dataJson map[string]interface{}
 	err = json.Unmarshal(data, &dataJson)
-	checkError(err)
+	checkErrorFatal(err)
 	//Set maindata stuff
 	Maindata.Streamer = dataJson["streamer"].(string)
 	Maindata.CallbackURL = dataJson["callbackURL"].(string)
@@ -136,26 +173,36 @@ func getConfigData() (cont bool) {
 	return true
 }
 
-func getStreamerID(streamer string, token string, client http.Client) (id string) {
+//Retrieve streamer's Twitch ID
+//If an error occurs, this method will echo it
+func getStreamerID(streamer string, token string, client http.Client) (id string, err error) {
 	//Form request for user data
 	request, err := http.NewRequest("GET", "https://api.twitch.tv/helix/users?login="+streamer, nil)
-	checkError(err)
+	if err != nil {
+		return "", err
+	}
 	//Add auth header
 	request.Header.Set("Client-ID", ClientID)
 	request.Header.Set("Authorization", "Bearer "+token)
 
 	//Get response
 	response, err := client.Do(request)
-	checkError(err)
+	if err != nil {
+		return "", err
+	}
 	checkRateLimit(response)
 	body, err := ioutil.ReadAll(response.Body)
-	checkError(err)
+	if err != nil {
+		return "", err
+	}
 
 	//Extract response to JSON
 	var responseJson map[string]interface{}
 	err = json.Unmarshal(body, &responseJson)
 	_ = response.Body.Close()
-	checkError(err)
+	if err != nil {
+		return "", err
+	}
 
 	//Check user actually exists
 	responseData := responseJson["data"]
@@ -165,7 +212,7 @@ func getStreamerID(streamer string, token string, client http.Client) (id string
 	//Extract user ID
 	firstData := responseData.([]interface{})[0].(map[string]interface{})
 	id = firstData["id"].(string)
-	return id
+	return id, nil
 }
 
 func getToken() string {
@@ -173,14 +220,14 @@ func getToken() string {
 		"?client_id="+ClientID+
 		"&client_secret="+secret.ClientSecret+
 		"&grant_type=client_credentials", "application/json", nil)
-	checkError(err)
+	checkErrorFatal(err)
 	if response.StatusCode != 200 {
 		log.Fatal("Failed to get token, status code:",response.StatusCode)
 		return ""
 	}
 	var resultJson map[string]interface{}
 	err = json.NewDecoder(response.Body).Decode(&resultJson)
-	checkError(err)
+	checkErrorFatal(err)
 	_ = response.Body.Close()
 	token := resultJson["access_token"].(string)
 	return token
@@ -192,12 +239,12 @@ func checkRateLimit(response *http.Response) {
 	log.Println("Rate limit:", rateLimit)
 	//Check remaining points
 	remainingPoints, err := strconv.Atoi(response.Header.Get("Ratelimit-Remaining"))
-	checkError(err)
+	checkErrorFatal(err)
 	log.Println("Remaining points:", remainingPoints)
 	if response.StatusCode == 429 {
 		//Find reset time
 		i, err := strconv.ParseInt(response.Header.Get("Ratelimit-Reset"), 10, 64)
-		checkError(err)
+		checkErrorFatal(err)
 		resetTime := time.Unix(i, 0)
 		resetTimeString := resetTime.Format("3:04 PM")
 		log.Fatalf("Twitch rate limit exceeded, cannot continue (Are you spamming?)\n"+
@@ -206,57 +253,94 @@ func checkRateLimit(response *http.Response) {
 }
 
 //Get a game by its ID and put it into the cache
-func getGameFromId(id string, client http.Client) (name string) {
+func getGameFromId(id string, client http.Client) (name string, err error) {
+	//Check cache first
+	if val, ok := Gamecache[id]; ok {
+		return val, nil
+	}
+
+	//Start process to get game ID
 	token := Maindata.Token
 	if token == "" {
 		log.Fatalln("No auth token found")
 	}
 	//Form request for user data
 	request, err := http.NewRequest("GET", "https://api.twitch.tv/helix/games?id="+id, nil)
-	checkError(err)
+	checkErrorFatal(err)
 	//Add auth header
 	request.Header.Set("Client-ID", ClientID)
 	request.Header.Set("Authorization", "Bearer "+token)
 
 	//Get response
 	response, err := client.Do(request)
-	checkError(err)
+	checkErrorFatal(err)
 	if response.StatusCode != 200 {
-		log.Fatalln("Error querying game from Twitch API, HTTP Code", response.StatusCode)
+		msg := fmt.Sprint("Error querying game from Twitch API, HTTP Code ", response.StatusCode)
+		log.Println(msg)
+		return "", errors.New(msg)
 	}
 	checkRateLimit(response)
 	body, err := ioutil.ReadAll(response.Body)
-	checkError(err)
+	checkErrorFatal(err)
 
 	//Extract response to JSON
 	var responseJson map[string]interface{}
 	err = json.Unmarshal(body, &responseJson)
 	_ = response.Body.Close()
-	checkError(err)
+	checkErrorFatal(err)
 
 	//Check user actually exists
 	responseData := responseJson["data"]
 	if len(responseData.([]interface{})) == 0 {
-		log.Println("Could not find game with ID", id)
-		return ""
+		msg := fmt.Sprint("Could not find game with ID", id)
+		log.Println(msg)
+		return "", errors.New(msg)
 	}
 	//Extract game name
 	firstData := responseData.([]interface{})[0].(map[string]interface{})
 	name = firstData["name"].(string)
 	Gamecache[id] = name
-	return name
+	saveGameCache()
+	return name, nil
 }
 
 //Saves the Gamecache to disk
 func saveGameCache() {
-	bytes, err := json.MarshalIndent(&Gamecache, "", "    ")
-	checkError(err)
-
+	cacheBytes, err := json.MarshalIndent(&Gamecache, "", "    ")
+	checkErrorFatal(err)
+	//Check if there is a game cache
+	if _, err := os.Stat(cacheDisk); os.IsNotExist(err) {
+		log.Println(`No game cache file found, creating...`)
+		err = ioutil.WriteFile(cacheDisk, cacheBytes, 0777)
+		checkErrorFatal(err)
+		return
+	}
+	//Else append the new addition to the file
+	file, err := os.OpenFile(cacheDisk, os.O_RDWR, 0644)
+	checkErrorFatal(err)
+	defer file.Close()
+	err = file.Truncate(0)
+	checkErrorFatal(err)
+	_, err = file.Seek(0, 0)
+	checkErrorFatal(err)
+	_, err = file.WriteAt(cacheBytes, 0)
+	checkErrorFatal(err)
+	err = file.Sync()
+	checkErrorFatal(err)
 }
 
 //Loads the Gamecache from disk
+//If no Gamecache, fails silently
 func loadGameCache() {
-
+	//Check there is a cache file
+	if _, err := os.Stat(cacheDisk); os.IsNotExist(err) {
+		return
+	}
+	//Extract json from file
+	data, err := ioutil.ReadFile(cacheDisk)
+	checkErrorFatal(err)
+	err = json.Unmarshal(data, &Gamecache)
+	checkErrorFatal(err)
 }
 
 //Handles when the webhook issues a payload
@@ -266,20 +350,19 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		if query["hub.mode"][0] == "denied" {
 			_, err := fmt.Fprintf(w, "200 OK", nil)
-			checkError(err)
+			checkErrorFatal(err)
 			log.Println("Subscription to webhook was denied")
 			return
 		}
-		if !checkRequest(query) {
+		if query["hub.mode"][0] == "subscribe" && !checkRequest(query) {
 			log.Println("Did not get same subscription back")
 			return
 		}
 		challenge := query["hub.challenge"][0]
 		_, err := w.Write([]byte(challenge))
-		checkError(err)
+		checkErrorFatal(err)
 		return
 	}
-	//TODO: handle payload
 	payload := make(map[string]interface{})
 	err := json.NewDecoder(r.Body).Decode(&payload)
 	checkErrorResponse(err, w)
@@ -287,22 +370,54 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 	checkErrorResponse(err, w)
 	fmt.Println("Got json payload: ")
 	data := payload["data"].([]interface{})
+	//TODO: verify payload with signed secret
+	//Check if went offline
 	if len(data) == 0 {
-		//Went offline
 		Streamerdata.Online = false
-		log.Println(Maindata.Streamer, "went offline")
+		logMsg := fmt.Sprintf("%s went offline", Maindata.Streamer)
+		logEvent(logMsg)
+		//TODO: Refresh program
 		return
 	}
-	streamdata := data[0].(map[string]interface{})
-	Streamerdata.Title = streamdata["title"].(string)
+	//Get additional data
+	streamData := data[0].(map[string]interface{})
+	title := streamData["title"].(string)
+	gameid := streamData["game_id"].(string)
+	game, err := getGameFromId(gameid, client)
+	if err != nil {
+		checkErrorResponse(err, w)
+	}
+	//Check if start of stream
 	if !Streamerdata.Online {
 		Streamerdata.Online = true
-		log.Println(Maindata.Streamer, "went online!")
+		logMsg := fmt.Sprintf("%s started streaming %s | Title: \"%s\"", Maindata.Streamer, game, title)
+		logEvent(logMsg)
+		updateStreamer(title, game, gameid)
+		return
+	}
+	//Mark change
+	if gameid != Streamerdata.GameID { //Changed games
+		logMsg := fmt.Sprintf("%s switched to %s | Title: \"%s\"", Maindata.Streamer, game, title)
+		logEvent(logMsg)
+		updateStreamer(title, game, gameid)
+	} else if title != Streamerdata.Title {
+		logMsg := fmt.Sprintf("%s changed stream title | Title: \"%s\"", Maindata.Streamer, title)
+		logEvent(logMsg)
+		updateStreamer(title, game, gameid)
 	}
 }
 
+//Updates Streamerdata with appropriate data
+func updateStreamer(title string, game string, gameid string) {
+	Streamerdata.Title = title
+	Streamerdata.Game = game
+	Streamerdata.GameID = gameid
+}
+
+//Checks for an error, and if err != nil, write
 func checkErrorResponse(err error, w http.ResponseWriter) {
 	if err != nil {
+		checkError(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -310,4 +425,22 @@ func checkErrorResponse(err error, w http.ResponseWriter) {
 //Checks that the request is what we requested
 func checkRequest(values url.Values) bool {
 	return values["hub.topic"][0] == TopicURL + Maindata.ID
+}
+
+func logEvent(message string) {
+	log.Println(message)
+	//Check the logfile name has been set
+	if logFilename == "" {
+		logFilename = "logs/"+time.Now().Format("2006-01-02_15-04-05")+".log"
+	}
+	//Open the log file for appending
+	f, err := os.OpenFile(logFilename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	checkErrorFatal(err)
+	defer f.Close()
+	//Prepend time to message
+	t := time.Now()
+	message = t.Format("[Jan 2, 2006 | 15:04:05] ") + message
+	//Log message
+	_, err = f.Write([]byte(message))
+	checkErrorFatal(err)
 }
