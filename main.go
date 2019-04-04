@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,12 +21,7 @@ import (
 
 const ClientID = `ari2vux13uqzdxek5b4r1vw2vg80ix`
 const TopicURL = `https://api.twitch.tv/helix/streams?user_id=`
-
-var DefaultConfig = map[string]interface{} {
-	"streamer": "STREAMER NAME HERE",
-	"callbackURL": "CALLBACK URL HERE",
-	"port": "8080",
-}
+const HookURL = `https://api.twitch.tv/helix/webhooks/hub`
 
 type MainData struct {
 	Streamer string
@@ -40,12 +38,18 @@ type StreamerData struct {
 	Title string
 }
 
+var DefaultConfig = map[string]interface{} {
+	"streamer": "STREAMER NAME HERE",
+	"callbackURL": "CALLBACK URL HERE",
+	"port": "8080",
+}
 var Maindata MainData
 var Streamerdata StreamerData
 var Gamecache = make(map[string]string)
 var cacheDisk = `cache.json`
 var logFilename = ""
 var client = http.Client{}
+var seenNotifIDs = make(map[string]struct{}) //Make map to allow for easy contains check
 
 //Fatally reports an error
 func checkErrorFatal(err error) {
@@ -99,9 +103,7 @@ func main() {
 	//Subscribe to proper webhook
 	subToWebhook(callbackURL, id)
 
-	//Set log file name
-	t := time.Now()
-	logFilename = "logs/" + t.Format("2006-01-02_15-04-05") + ".log"
+	//TODO: Perform initial query
 
 	//Setup complete mark
 	elapsed := time.Since(start)
@@ -115,9 +117,16 @@ func main() {
 	fmt.Println("test")
 }
 
+//Refresh hook
+func refresh() {
+	unsubFromWebhook(Maindata.CallbackURL, Maindata.ID)
+	//Setup new log file
+	logFilename = ""
+	subToWebhook(Maindata.CallbackURL, Maindata.ID)
+}
+
 //Subscribes to the webhook
 func subToWebhook(callbackURL string, id string) {
-	hookURL := `https://api.twitch.tv/helix/webhooks/hub`
 	payload := map[string]interface{}{
 		"hub.callback":      callbackURL + "/webhook",
 		"hub.mode":          "subscribe",
@@ -125,10 +134,25 @@ func subToWebhook(callbackURL string, id string) {
 		"hub.lease_seconds": "864000",
 		"hub.secret":        secret.PayloadSecret,
 	}
+	sendPayloadToHookHub(payload)
+}
+
+//Unsubscribes from webhook
+func unsubFromWebhook(callbackURL string, id string) {
+	payload := map[string]interface{}{
+		"hub.callback":      callbackURL + "/webhook",
+		"hub.mode":          "unsubscribe",
+		"hub.topic":         TopicURL + id,
+		"hub.secret":        secret.PayloadSecret,
+	}
+	sendPayloadToHookHub(payload)
+}
+
+func sendPayloadToHookHub(payload map[string]interface{}) {
 	payloadBytes, err := json.Marshal(payload)
 	checkErrorFatal(err)
 	//Create request
-	request, err := http.NewRequest("POST", hookURL, bytes.NewBuffer(payloadBytes))
+	request, err := http.NewRequest("POST", HookURL, bytes.NewBuffer(payloadBytes))
 	checkErrorFatal(err)
 	//Add auth header
 	request.Header.Set("Client-ID", ClientID)
@@ -140,10 +164,6 @@ func subToWebhook(callbackURL string, id string) {
 	if response.StatusCode != 202 {
 		log.Fatalln("Payload not accepted, HTTP code", string(response.StatusCode))
 	}
-}
-
-func unsubFromWebhook(callbackURL string, id string) {
-	//TODO: Unsub from the hook
 }
 
 // Put config data into main data if it can be found
@@ -215,6 +235,7 @@ func getStreamerID(streamer string, token string, client http.Client) (id string
 	return id, nil
 }
 
+//Gets an auth token
 func getToken() string {
 	response, err := http.Post("https://id.twitch.tv/oauth2/token"+
 		"?client_id="+ClientID+
@@ -234,13 +255,6 @@ func getToken() string {
 }
 
 func checkRateLimit(response *http.Response) {
-	//TEMP: See rate limit
-	rateLimit := response.Header.Get("Ratelimit-Limit")
-	log.Println("Rate limit:", rateLimit)
-	//Check remaining points
-	remainingPoints, err := strconv.Atoi(response.Header.Get("Ratelimit-Remaining"))
-	checkErrorFatal(err)
-	log.Println("Remaining points:", remainingPoints)
 	if response.StatusCode == 429 {
 		//Find reset time
 		i, err := strconv.ParseInt(response.Header.Get("Ratelimit-Reset"), 10, 64)
@@ -345,8 +359,11 @@ func loadGameCache() {
 
 //Handles when the webhook issues a payload
 func handleHook(w http.ResponseWriter, r *http.Request) {
+	//Acknowledge reception
+	w.WriteHeader(http.StatusOK)
 	//Respond to challenge query
-	if r.Method == "GET" || r.Method == "" {
+	if r.Method == "GET" || r.Method == "" { //GET only on challenge
+		//Get query
 		query := r.URL.Query()
 		if query["hub.mode"][0] == "denied" {
 			_, err := fmt.Fprintf(w, "200 OK", nil)
@@ -363,20 +380,38 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 		checkErrorFatal(err)
 		return
 	}
+	signature := r.Header.Get("X-Hub-Signature")
+	//Check for duplicate notification (include signature because weirdness)
+	notifID := r.Header.Get("Twitch-Notification-Id") + signature
+	if _, ok := seenNotifIDs[notifID]; ok {
+		//Seen before, ignore
+		return
+	}
+	seenNotifIDs[notifID+signature] = struct{}{}
+	//Check signature of payload
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	h := hmac.New(sha256.New, []byte(secret.PayloadSecret))
+	h.Write(bodyBytes)
+	hash := "sha256="+hex.EncodeToString(h.Sum(nil))
+	if hash != signature {
+		log.Fatalln("Signature invalid, header:", signature, "| calculated hash:", hash)
+	}
+	//Dealing with a notificaton, get timestamp
+	timestamp, err := time.Parse(time.RFC3339, r.Header.Get("Twitch-Notification-Timestamp"))
+	checkError(err)
+
+	//Extract JSON payload
 	payload := make(map[string]interface{})
-	err := json.NewDecoder(r.Body).Decode(&payload)
-	checkErrorResponse(err, w)
-	err = r.Body.Close()
-	checkErrorResponse(err, w)
-	fmt.Println("Got json payload: ")
+	err = json.Unmarshal(bodyBytes, &payload)
+	checkErrorFatal(err)
+
 	data := payload["data"].([]interface{})
-	//TODO: verify payload with signed secret
 	//Check if went offline
 	if len(data) == 0 {
 		Streamerdata.Online = false
 		logMsg := fmt.Sprintf("%s went offline", Maindata.Streamer)
-		logEvent(logMsg)
-		//TODO: Refresh program
+		logEvent(logMsg, timestamp)
+		refresh()
 		return
 	}
 	//Get additional data
@@ -391,18 +426,18 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 	if !Streamerdata.Online {
 		Streamerdata.Online = true
 		logMsg := fmt.Sprintf("%s started streaming %s | Title: \"%s\"", Maindata.Streamer, game, title)
-		logEvent(logMsg)
+		logEvent(logMsg, timestamp)
 		updateStreamer(title, game, gameid)
 		return
 	}
 	//Mark change
 	if gameid != Streamerdata.GameID { //Changed games
 		logMsg := fmt.Sprintf("%s switched to %s | Title: \"%s\"", Maindata.Streamer, game, title)
-		logEvent(logMsg)
+		logEvent(logMsg, timestamp)
 		updateStreamer(title, game, gameid)
 	} else if title != Streamerdata.Title {
 		logMsg := fmt.Sprintf("%s changed stream title | Title: \"%s\"", Maindata.Streamer, title)
-		logEvent(logMsg)
+		logEvent(logMsg, timestamp)
 		updateStreamer(title, game, gameid)
 	}
 }
@@ -427,19 +462,18 @@ func checkRequest(values url.Values) bool {
 	return values["hub.topic"][0] == TopicURL + Maindata.ID
 }
 
-func logEvent(message string) {
+func logEvent(message string, timestamp time.Time) {
 	log.Println(message)
 	//Check the logfile name has been set
 	if logFilename == "" {
-		logFilename = "logs/"+time.Now().Format("2006-01-02_15-04-05")+".log"
+		logFilename = "logs/"+timestamp.Format("2006-01-02_15-04-05")+".log"
 	}
 	//Open the log file for appending
 	f, err := os.OpenFile(logFilename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	checkErrorFatal(err)
 	defer f.Close()
 	//Prepend time to message
-	t := time.Now()
-	message = t.Format("[Jan 2, 2006 | 15:04:05] ") + message
+	message = timestamp.Format("[Jan 2, 2006 | 15:04:05] ") + message + "\n"
 	//Log message
 	_, err = f.Write([]byte(message))
 	checkErrorFatal(err)
