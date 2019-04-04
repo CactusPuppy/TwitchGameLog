@@ -29,10 +29,17 @@ type MainData struct {
 	Port string
 	ID string
 	Token string
-	Online bool
 }
 
-var maindata MainData
+type StreamerData struct {
+	Online bool
+	Game string
+	Title string
+}
+
+var Maindata MainData
+var Streamerdata StreamerData
+var Gamecache map[string]string
 
 func checkError(err error) {
 	if err != nil {
@@ -49,25 +56,22 @@ func main() {
 	client := http.Client{}
 	//Get an access token
 	token := getToken()
-	maindata.Token = token
+	Maindata.Token = token
 
-	//TODO: Get config values
-	maindata.Streamer = "cactuspupbot"
-	maindata.CallbackURL = "https://480ba225.ngrok.io"
-	maindata.Port = "8080"
-	maindata.Online = false
-
+	//Get config data
 	if !getConfigData() {
 		return
 	}
 
-	streamer := maindata.Streamer
-	callbackURL := maindata.CallbackURL
-	port := maindata.Port
+	//Get game id cache
+
+	streamer := Maindata.Streamer
+	callbackURL := Maindata.CallbackURL
+	port := Maindata.Port
 
 	//Get streamer ID
 	id := getStreamerID(streamer, token, client)
-	maindata.ID = id
+	Maindata.ID = id
 	log.Println("Now tracking",streamer,"(ID:",id+")")
 
 	//Subscribe to proper webhook
@@ -126,9 +130,9 @@ func getConfigData() (cont bool) {
 	err = json.Unmarshal(data, &dataJson)
 	checkError(err)
 	//Set maindata stuff
-	maindata.Streamer = dataJson["streamer"].(string)
-	maindata.CallbackURL = dataJson["callbackURL"].(string)
-	maindata.Port = dataJson["port"].(string)
+	Maindata.Streamer = dataJson["streamer"].(string)
+	Maindata.CallbackURL = dataJson["callbackURL"].(string)
+	Maindata.Port = dataJson["port"].(string)
 	return true
 }
 
@@ -201,7 +205,61 @@ func checkRateLimit(response *http.Response) {
 	}
 }
 
-//Handles when the webhook issues a thingy
+//Get a game by its ID and put it into the cache
+func getGameFromId(id string, client http.Client) (name string) {
+	token := Maindata.Token
+	if token == "" {
+		log.Fatalln("No auth token found")
+	}
+	//Form request for user data
+	request, err := http.NewRequest("GET", "https://api.twitch.tv/helix/games?id="+id, nil)
+	checkError(err)
+	//Add auth header
+	request.Header.Set("Client-ID", ClientID)
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	//Get response
+	response, err := client.Do(request)
+	checkError(err)
+	if response.StatusCode != 200 {
+		log.Fatalln("Error querying game from Twitch API, HTTP Code", response.StatusCode)
+	}
+	checkRateLimit(response)
+	body, err := ioutil.ReadAll(response.Body)
+	checkError(err)
+
+	//Extract response to JSON
+	var responseJson map[string]interface{}
+	err = json.Unmarshal(body, &responseJson)
+	_ = response.Body.Close()
+	checkError(err)
+
+	//Check user actually exists
+	responseData := responseJson["data"]
+	if len(responseData.([]interface{})) == 0 {
+		log.Println("Could not find game with ID", id)
+		return ""
+	}
+	//Extract game name
+	firstData := responseData.([]interface{})[0].(map[string]interface{})
+	name = firstData["name"].(string)
+	Gamecache[id] = name
+	return name
+}
+
+//Saves the Gamecache to disk
+func saveGameCache() {
+	bytes, err := json.MarshalIndent(&Gamecache, "", "    ")
+	checkError(err)
+
+}
+
+//Loads the Gamecache from disk
+func loadGameCache() {
+
+}
+
+//Handles when the webhook issues a payload
 func handleHook(w http.ResponseWriter, r *http.Request) {
 	//Respond to challenge query
 	if r.Method == "GET" || r.Method == "" {
@@ -217,15 +275,39 @@ func handleHook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		challenge := query["hub.challenge"][0]
-		log.Println("Challenge:",challenge)
 		_, err := w.Write([]byte(challenge))
 		checkError(err)
 		return
 	}
 	//TODO: handle payload
+	payload := make(map[string]interface{})
+	err := json.NewDecoder(r.Body).Decode(&payload)
+	checkErrorResponse(err, w)
+	err = r.Body.Close()
+	checkErrorResponse(err, w)
+	fmt.Println("Got json payload: ")
+	data := payload["data"].([]interface{})
+	if len(data) == 0 {
+		//Went offline
+		Streamerdata.Online = false
+		log.Println(Maindata.Streamer, "went offline")
+		return
+	}
+	streamdata := data[0].(map[string]interface{})
+	Streamerdata.Title = streamdata["title"].(string)
+	if !Streamerdata.Online {
+		Streamerdata.Online = true
+		log.Println(Maindata.Streamer, "went online!")
+	}
+}
+
+func checkErrorResponse(err error, w http.ResponseWriter) {
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 //Checks that the request is what we requested
 func checkRequest(values url.Values) bool {
-	return values["hub.topic"][0] == TopicURL + maindata.ID
+	return values["hub.topic"][0] == TopicURL + Maindata.ID
 }
