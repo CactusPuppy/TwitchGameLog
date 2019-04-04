@@ -108,10 +108,10 @@ func main() {
 // Put config data into main data if it can be found
 // Returns whether the data was got and the program can continue
 func getConfigData() (cont bool) {
-	configPath := "config.yml"
+	configPath := "config.json"
 	//Check if config exists
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		log.Println(`No config.yml file found, generating with defaults...
+		log.Println(`No`, configPath, `file found, generating with defaults...
 				PLEASE SET CONFIG VALUES BEFORE RESTARTING`)
 		configBytes, err := json.MarshalIndent(DefaultConfig, "", "    ")
 		checkError(err)
