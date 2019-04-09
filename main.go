@@ -16,12 +16,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const ClientID = `ari2vux13uqzdxek5b4r1vw2vg80ix`
 const TopicURL = `https://api.twitch.tv/helix/streams?user_id=`
 const HookURL = `https://api.twitch.tv/helix/webhooks/hub`
+const HookDur = 864000
 
 type MainData struct {
 	Streamer string
@@ -126,6 +128,16 @@ func setupStreamerData() {
 	//Get response
 	response, err := client.Do(request)
 	checkError(err)
+	//If 503, retry once
+	if response.StatusCode == 503 {
+		response, err = client.Do(request)
+		checkError(err)
+		if response.StatusCode == 503 {
+			err = errors.New(strings.Title("Twitch service is currently down, try again later"))
+			checkError(err)
+			return
+		}
+	}
 	checkRateLimit(response)
 	body, err := ioutil.ReadAll(response.Body)
 	checkError(err)
@@ -159,13 +171,17 @@ func refresh() {
 	subToWebhook(Maindata.CallbackURL, Maindata.ID)
 }
 
+func delayRefresh() {
+
+}
+
 //Subscribes to the webhook
 func subToWebhook(callbackURL string, id string) {
 	payload := map[string]interface{}{
 		"hub.callback":      callbackURL + "/webhook",
 		"hub.mode":          "subscribe",
 		"hub.topic":         TopicURL + id,
-		"hub.lease_seconds": "864000",
+		"hub.lease_seconds": string(HookDur),
 		"hub.secret":        secret.PayloadSecret,
 	}
 	sendPayloadToHookHub(payload)
